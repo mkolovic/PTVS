@@ -14,7 +14,10 @@
 // See the Apache Version 2.0 License for specific language governing
 // permissions and limitations under the License.
 
+// Copyright (c) 2017 Intel Corporation.  All rights reserved.
+
 using System;
+using System.IO;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
@@ -30,7 +33,7 @@ namespace Microsoft.PythonTools.Profiling {
         private ReadOnlyCollection<ProjectTargetView> _availableProjects;
         
         private ProjectTargetView _project;
-        private bool _isProjectSelected, _isStandaloneSelected;
+        private bool _isProjectSelected, _isStandaloneSelected, _isVTuneAvailable, _useVTune;
         private StandaloneTargetView _standalone;
         private readonly string _startText;
 
@@ -55,12 +58,14 @@ namespace Microsoft.PythonTools.Profiling {
                 availableProjects.Add(new ProjectTargetView((IVsHierarchy)project));
             }
             _availableProjects = new ReadOnlyCollection<ProjectTargetView>(availableProjects);
+            _isVTuneAvailable = CheckForVTune();
 
             _project = null;
             _standalone = new StandaloneTargetView(serviceProvider);
             _isProjectSelected = true;
 
             _isValid = false;
+            _useVTune = true;
 
             PropertyChanged += new PropertyChangedEventHandler(ProfilingTargetView_PropertyChanged);
             _standalone.PropertyChanged += new PropertyChangedEventHandler(Standalone_PropertyChanged);
@@ -96,6 +101,7 @@ namespace Microsoft.PythonTools.Profiling {
                 Project = new ProjectTargetView(template.ProjectTarget);
                 IsStandaloneSelected = false;
                 IsProjectSelected = true;
+                UseVTune = true;
             } else if (template.StandaloneTarget != null) {
                 Standalone = new StandaloneTargetView(serviceProvider, template.StandaloneTarget);
                 IsProjectSelected = false;
@@ -109,10 +115,12 @@ namespace Microsoft.PythonTools.Profiling {
         /// </summary>
         public ProfilingTarget GetTarget() {
             if (IsValid) {
-                return new ProfilingTarget {
+                var t = new ProfilingTarget {
                     ProjectTarget = IsProjectSelected ? Project.GetTarget() : null,
-                    StandaloneTarget = IsStandaloneSelected ? Standalone.GetTarget() : null
+                    StandaloneTarget = IsStandaloneSelected ? Standalone.GetTarget() : null,
+					UseVTune = _useVTune
                 };
+                return t;
             } else {
                 return null;
             }
@@ -152,6 +160,15 @@ namespace Microsoft.PythonTools.Profiling {
         /// <summary>
         /// True if a project is the currently selected target; otherwise, false.
         /// </summary>
+        public bool IsVTuneAvailable {
+            get {
+                return _isVTuneAvailable;
+            }
+	}
+
+        /// <summary>
+        /// True if a project is the currently selected target; otherwise, false.
+        /// </summary>
         public bool IsProjectSelected {
             get {
                 return _isProjectSelected;
@@ -161,6 +178,19 @@ namespace Microsoft.PythonTools.Profiling {
                     _isProjectSelected = value;
                     OnPropertyChanged("IsProjectSelected");
                 }
+            }
+        }
+
+        /// <summary>
+        /// True if useVTune is checked.
+        /// </summary>
+        public bool UseVTune {
+            get {
+                return _useVTune;
+            }
+            set {
+                _useVTune = value;
+                OnPropertyChanged("UseVTune");
             }
         }
 
@@ -257,6 +287,15 @@ namespace Microsoft.PythonTools.Profiling {
         /// Raised when the value of a property changes.
         /// </summary>
         public event PropertyChangedEventHandler PropertyChanged;
+
+        private static bool CheckForVTune() {
+	        // NOTE: Right now this is the 'sanctioned' way to check for VTune 2017 install dir,
+	        //       the name of the envvar will almost surely change for VTune 2018, and probably
+	        //       as soon as VTune 2017 update 3
+	        var vtunePath = Environment.GetEnvironmentVariable("VTUNE_AMPLIFIER_XE_2017_DIR");
+	        if (vtunePath == null) return false;
+	        return Directory.Exists(vtunePath);
+	    }
     }
 }
  

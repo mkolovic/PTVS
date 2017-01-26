@@ -1,6 +1,8 @@
 // Python Tools for Visual Studio
 // Copyright(c) Microsoft Corporation
 // All rights reserved.
+// Copyright(c) 2016 Intel Corporation
+// All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the License); you may not use
 // this file except in compliance with the License. You may obtain a copy of the
@@ -14,13 +16,17 @@
 // See the Apache Version 2.0 License for specific language governing
 // permissions and limitations under the License.
 
+// Copyright (c) 2017 Intel Corporation.  All rights reserved
+
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Windows;
 using Microsoft.PythonTools.Infrastructure;
+using Microsoft.VisualStudio.Shell;
 using Microsoft.VisualStudio.Shell.Interop;
 using Microsoft.Win32;
 
@@ -30,8 +36,15 @@ namespace Microsoft.PythonTools.Profiling {
         private readonly ProcessorArchitecture _arch;
         private readonly Process _process;
         private readonly PythonToolsService _pyService;
+        private readonly bool _useVTune;
 
-        public ProfiledProcess(PythonToolsService pyService, string exe, string args, string dir, Dictionary<string, string> envVars) {
+        // Python mixed mode profiling is only available on VTune 2017 or later
+        private static readonly string _vtunePath = "C:\\Program Files (x86)\\IntelSWTools\\VTune Amplifier XE 2017";
+        private static readonly string _vtuneCl = _vtunePath + "\\bin32\\amplxe-cl.exe";
+        private static readonly string[] _vtuneCollectOptions =  {"-collect hotspots", "-d 5", "-user-data-dir="};
+        private static readonly string[] _vtuneReportOptions = {"-report hotspots", "-r r000hs",  "-user-data-dir="}; // TODO: Check for latest run
+
+        public ProfiledProcess(PythonToolsService pyService, string exe, string args, string dir, Dictionary<string, string> envVars, bool useVTune) {
             var arch = NativeMethods.GetBinaryType(exe);
             if (arch != ProcessorArchitecture.X86 && arch != ProcessorArchitecture.Amd64) {
                 throw new InvalidOperationException(String.Format("Unsupported architecture: {0}", arch));
@@ -47,6 +60,7 @@ namespace Microsoft.PythonTools.Profiling {
             _args = args;
             _dir = dir;
             _arch = arch;
+            _useVTune = useVTune;
 
             ProcessStartInfo processInfo;
             string pythonInstallDir = Path.GetDirectoryName(PythonToolsInstallPath.GetFile("VsPyProf.dll", typeof(ProfiledProcess).Assembly));
@@ -86,16 +100,70 @@ namespace Microsoft.PythonTools.Profiling {
             _process.Dispose();
         }
 
-        public void StartProfiling(string filename) {
-            StartPerfMon(filename);
+        public bool StartProfiling(string filename) {
+            string outPath = "";
+            if (_useVTune) {
+                string[] opts = new string[_vtuneCollectOptions.Length + 3];
+                _vtuneCollectOptions.CopyTo(opts, 0);
+                outPath = ProcessOutput.QuoteSingleArgument(filename);
+                try
+                {
+                    Directory.CreateDirectory(outPath);
+                }
+                catch (Exception e)
+                {
+                    MessageBox.Show(String.Format("Unable to create VTune output directory: {0}", e.Message), "Python Tools for Visual Studio");
+                    return false;
+                }
+                string[] addtlOpts = { outPath, _exe, ProcessOutput.QuoteSingleArgument(_args.Trim('"')) };
+                addtlOpts.CopyTo(opts, _vtuneCollectOptions.Length);
+
+                ProcessStartInfo processInfo = new ProcessStartInfo(_vtuneCl, string.Join(" ", opts));
+                _process.StartInfo = processInfo;
+            } else {
+                StartPerfMon(filename);
+            }
             
             _process.EnableRaisingEvents = true;
             _process.Exited += (sender, args) => {
-                try {
-                    // Exited event is fired on a random thread pool thread, we need to handle exceptions.
-                    StopPerfMon();
-                } catch (InvalidOperationException e) {
-                    MessageBox.Show(String.Format("Unable to stop performance monitor: {0}", e.Message), "Python Tools for Visual Studio");
+                if (!_useVTune) {
+                    try {
+                        // Exited event is fired on a random thread pool thread, we need to handle exceptions.
+                        StopPerfMon();
+                    } catch (InvalidOperationException e) {
+                        MessageBox.Show(String.Format("Unable to stop performance monitor: {0}", e.Message), "Python Tools for Visual Studio");
+                    }
+                }
+                else
+                {
+                    string[] reportAddtlOpts = { outPath, "-csv-delimiter=\",\"", "-format=csv", "-report-output=" + outPath + "\\report.csv" };
+                    string[] reportOpts = new string[_vtuneReportOptions.Length + reportAddtlOpts.Length];
+                    _vtuneReportOptions.CopyTo(reportOpts, 0);
+                    reportAddtlOpts.CopyTo(reportOpts, _vtuneReportOptions.Length);
+                    using (var p = ProcessOutput.RunHiddenAndCapture(_vtuneCl, reportOpts))
+                    {
+                        p.Wait();
+                        if (p.ExitCode != 0)
+                        {
+                            throw new InvalidOperationException("Starting VTune report failed{0}{0}Output:{0}{1}{0}{0}Error:{0}{2}".FormatUI(
+                            Environment.NewLine,
+                            string.Join(Environment.NewLine, p.StandardOutputLines),
+                            string.Join(Environment.NewLine, p.StandardErrorLines)
+                            ));
+                        }
+                    };
+
+                    try
+                    {
+                        VTuneCSVToHTML(outPath + "\\report.csv");
+                    }
+                    catch (Exception e)
+                    {
+                        throw new InvalidOperationException("Failed writing VTune report{0}{0}Error:{0}{1}".FormatUI(
+                        Environment.NewLine,
+                        string.Join(Environment.NewLine, e.Message)
+                        ));
+                    }
                 }
                 var procExited = ProcessExited;
                 if (procExited != null) {
@@ -103,10 +171,52 @@ namespace Microsoft.PythonTools.Profiling {
                 }
             };
 
-            _process.Start();
+            return _process.Start();            
         }
 
         public event EventHandler ProcessExited;
+
+        private string VTuneCSVToHTML(string csvpath)
+        {
+            IEnumerable<string> records = File.ReadLines(csvpath);
+
+            using (StreamWriter outs = new StreamWriter(csvpath + ".html"))
+            {
+                outs.WriteLine(@"<!doctype html>
+<html>
+<head>
+<title>VTune report</title>
+<style>
+body { font-family: sans-serif; }
+table, td { border: 1px solid black; }
+th { background-color: gray; }
+</style>
+</head>
+<body><table>
+	    ");
+                foreach (var ri in records.Select((v, i) => new { i, v }))
+                {
+                    outs.WriteLine("<tr>");
+                    foreach (string f in ri.v.Split(','))
+                    {
+                        string ft = f.Trim('"');
+                        if (0 == ri.i)
+                        {
+                            outs.WriteLine("<th>" + ft + "</th>");
+                        }
+                        else
+                        {
+                            outs.WriteLine("<td>" + ft + "</td>");
+                        }
+                    }
+                    outs.WriteLine("</tr>");
+                }
+                outs.WriteLine("</table></body>");
+                outs.WriteLine("</html>");
+            }
+
+            return csvpath + ".html";
+        }
 
         private void StartPerfMon(string filename) {
             string perfToolsPath = GetPerfToolsPath();
@@ -141,7 +251,6 @@ namespace Microsoft.PythonTools.Profiling {
             string perfToolsPath = GetPerfToolsPath();
 
             string perfMonPath = Path.Combine(perfToolsPath, "VSPerfCmd.exe");
-
             using (var p = ProcessOutput.RunHiddenAndCapture(perfMonPath, "/shutdown")) {
                 p.Wait();
                 if (p.ExitCode != 0) {

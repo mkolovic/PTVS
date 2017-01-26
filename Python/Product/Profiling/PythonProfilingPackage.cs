@@ -1,6 +1,8 @@
 // Python Tools for Visual Studio
 // Copyright(c) Microsoft Corporation
 // All rights reserved.
+// Copyright(c) 2016 Intel Corporation
+// All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the License); you may not use
 // this file except in compliance with the License. You may obtain a copy of the
@@ -210,7 +212,7 @@ namespace Microsoft.PythonTools.Profiling {
                 }
 
                 if (target.ProjectTarget != null) {
-                    ProfileProjectTarget(session, target.ProjectTarget, openReport);
+                    ProfileProjectTarget(session, target.ProjectTarget, openReport, target.UseVTune);
                 } else if (target.StandaloneTarget != null) {
                     ProfileStandaloneTarget(session, target.StandaloneTarget, openReport);
                 } else {
@@ -224,7 +226,7 @@ namespace Microsoft.PythonTools.Profiling {
             });
         }
 
-        private void ProfileProjectTarget(SessionNode session, ProjectTarget projectTarget, bool openReport) {
+        private void ProfileProjectTarget(SessionNode session, ProjectTarget projectTarget, bool openReport, bool useVTune) {
             var targetGuid = projectTarget.TargetProject;
 
             var dte = (EnvDTE.DTE)GetService(typeof(EnvDTE.DTE));
@@ -244,13 +246,13 @@ namespace Microsoft.PythonTools.Profiling {
             }
 
             if (projectToProfile != null) {
-                ProfileProject(session, projectToProfile, openReport);
+                ProfileProject(session, projectToProfile, openReport, useVTune);
             } else {
                 MessageBox.Show("Project could not be found in current solution.", "Python Tools for Visual Studio");
             }
         }
 
-        private static void ProfileProject(SessionNode session, EnvDTE.Project projectToProfile, bool openReport) {
+        private static void ProfileProject(SessionNode session, EnvDTE.Project projectToProfile, bool openReport, bool useVTune) {
             var project = projectToProfile.AsPythonProject();
 
             var config = project?.GetLaunchConfigurationOrThrow();
@@ -271,7 +273,7 @@ namespace Microsoft.PythonTools.Profiling {
                 }
             }
 
-            RunProfiler(session, config, openReport);
+            RunProfiler(session, config, openReport, useVTune);
         }
 
         private static void ProfileStandaloneTarget(SessionNode session, StandaloneTarget runTarget, bool openReport) {
@@ -292,26 +294,32 @@ namespace Microsoft.PythonTools.Profiling {
             config.ScriptArguments = runTarget.Arguments;
             config.WorkingDirectory = runTarget.WorkingDirectory;
 
-            RunProfiler(session, config, openReport);
+            RunProfiler(session, config, openReport, false);
         }
 
 
-        private static void RunProfiler(SessionNode session, LaunchConfiguration config, bool openReport) {
+        private static void RunProfiler(SessionNode session, LaunchConfiguration config, bool openReport, bool useVTune) {
             var process = new ProfiledProcess(
                 (PythonToolsService)session._serviceProvider.GetService(typeof(PythonToolsService)),
                 config.GetInterpreterPath(),
                 string.Join(" ", ProcessOutput.QuoteSingleArgument(config.ScriptName), config.ScriptArguments),
                 config.WorkingDirectory,
-                session._serviceProvider.GetPythonToolsService().GetFullEnvironment(config)
+                session._serviceProvider.GetPythonToolsService().GetFullEnvironment(config),
+                useVTune
             );
 
             string baseName = Path.GetFileNameWithoutExtension(session.Filename);
             string date = DateTime.Now.ToString("yyyyMMdd");
-            string outPath = Path.Combine(Path.GetTempPath(), baseName + "_" + date + ".vsp");
+            string ext = ".vsp"; 
+            if (useVTune)
+            {
+                ext = ".vt";
+            }
+            string outPath = Path.Combine(Path.GetTempPath(), baseName + "_" + date + ext);
 
             int count = 1;
             while (File.Exists(outPath)) {
-                outPath = Path.Combine(Path.GetTempPath(), baseName + "_" + date + "(" + count + ").vsp");
+                outPath = Path.Combine(Path.GetTempPath(), baseName + "_" + date + "(" + count + ")" + ext);
                 count++;
             }
 
@@ -320,8 +328,19 @@ namespace Microsoft.PythonTools.Profiling {
                 _profilingProcess = null;
                 _stopCommand.Enabled = false;
                 _startCommand.Enabled = true;
-                if (openReport && File.Exists(outPath)) {
-                    dte.ItemOperations.OpenFile(outPath);
+                if (useVTune) {
+                    outPath += "\\report.csv.html";
+                }
+                if (openReport && File.Exists(outPath))
+                {
+                    if (useVTune)
+                    {
+                        dte.ItemOperations.Navigate(outPath);
+                    }
+                    else
+                    {
+                        dte.ItemOperations.OpenFile(outPath);
+                    }
                 }
             };
 
